@@ -1,6 +1,6 @@
 use omnom::prelude::*;
 use std::collections::HashMap;
-use std::io::{BufRead, Cursor, Read};
+use std::io::{BufRead, Cursor};
 
 fn main() {
     assert_eq!(
@@ -31,6 +31,44 @@ pub struct Mime {
     parameters: Option<HashMap<String, String>>,
 }
 
+fn take1<R: BufRead>(mut s: R) -> Option<u8> {
+    let mut token = vec![0; 1];
+    s.read_exact(&mut token).ok()?;
+
+    Some(token[0])
+}
+
+fn take_str_while<R: BufRead, P>(mut s: R, predicate: P) -> Option<String>
+where
+    P: FnMut(u8) -> bool,
+{
+    let mut val = vec![];
+    s.read_while(&mut val, predicate).ok()?;
+    validate_code_points(&val)?;
+    let mut val = String::from_utf8(val).ok()?;
+    val.make_ascii_lowercase();
+
+    Some(val)
+}
+
+fn take_str_until<R: BufRead>(mut s: R, delim: u8) -> Option<String> {
+    let mut val = vec![];
+    match s.read_until(delim, &mut val).ok()? {
+        0 => return None,
+        _ => {
+            if let Some(last) = val.last() {
+                if *last == delim {
+                    val.pop();
+                }
+            }
+        }
+    };
+
+    validate_code_points(&val)?;
+
+    String::from_utf8(val).ok()
+}
+
 fn parse_mime(s: &str) -> Option<Mime> {
     // parse the "type"
     //
@@ -39,12 +77,7 @@ fn parse_mime(s: &str) -> Option<Mime> {
     // ^^^^^
     // ```
     let mut s = Cursor::new(s);
-    let mut base_type = vec![];
-    match s.read_until(b'/', &mut base_type).unwrap() {
-        0 => return None,
-        _ => base_type.pop(),
-    };
-    validate_code_points(&base_type)?;
+    let base_type = take_str_until(&mut s, b'/')?;
 
     // parse the "subtype"
     //
@@ -52,19 +85,7 @@ fn parse_mime(s: &str) -> Option<Mime> {
     // text/html; charset=utf-8;
     //      ^^^^^
     // ```
-    let mut sub_type = vec![];
-    match s.read_until(b';', &mut sub_type).unwrap() {
-        0 => return None,
-        _ => sub_type.pop(),
-    };
-    validate_code_points(&sub_type)?;
-
-    // instantiate our mime struct
-    let mut mime = Mime {
-        base_type: String::from_utf8(base_type).unwrap(),
-        sub_type: String::from_utf8(sub_type).unwrap(),
-        parameters: None,
-    };
+    let sub_type = take_str_until(&mut s, b';')?;
 
     // parse parameters into a hashmap
     //
@@ -72,6 +93,8 @@ fn parse_mime(s: &str) -> Option<Mime> {
     // text/html; charset=utf-8;
     //           ^^^^^^^^^^^^^^^
     // ```
+
+    let mut parameters = None;
     loop {
         // Stop parsing if there's no more bytes to consume.
         if s.fill_buf().unwrap().len() == 0 {
@@ -92,12 +115,7 @@ fn parse_mime(s: &str) -> Option<Mime> {
         // text/html; charset=utf-8;
         //            ^^^^^^^
         // ```
-        let mut param_name = vec![];
-        s.read_while(&mut param_name, |b| b != b';' && b != b'=')
-            .ok()?;
-        validate_code_points(&param_name)?;
-        let mut param_name = String::from_utf8(param_name).ok()?;
-        param_name.make_ascii_lowercase();
+        let param_name = take_str_while(&mut s, |b| b != b';' && b != b'=')?;
 
         // Ignore param names without values.
         //
@@ -105,9 +123,8 @@ fn parse_mime(s: &str) -> Option<Mime> {
         // text/html; charset=utf-8;
         //                   ^
         // ```
-        let mut token = vec![0; 1];
-        s.read_exact(&mut token).unwrap();
-        if token[0] == b';' {
+        let token = take1(&mut s)?;
+        if token == b';' {
             continue;
         }
 
@@ -117,23 +134,22 @@ fn parse_mime(s: &str) -> Option<Mime> {
         // text/html; charset=utf-8;
         //                    ^^^^^^
         // ```
-        let mut param_value = vec![];
-        match s.read_until(b';', &mut param_value).ok()? {
-            0 => return None,
-            _ => param_value.pop(),
-        };
-        validate_code_points(&param_value)?;
-        let mut param_value = String::from_utf8(param_value).ok()?;
-        param_value.make_ascii_lowercase();
+        let param_value = take_str_until(&mut s, b';')?;
 
         // Insert attribute pair into hashmap.
-        if let None = mime.parameters {
-            mime.parameters = Some(HashMap::new());
+        if let None = parameters {
+            parameters = Some(HashMap::new());
         }
-        mime.parameters.as_mut()?.insert(param_name, param_value);
+        parameters.as_mut()?.insert(param_name, param_value);
     }
 
-    Some(mime)
+    // Construct the actual Mime struct.
+
+    Some(Mime {
+        base_type,
+        sub_type,
+        parameters,
+    })
 }
 
 fn validate_code_points(buf: &[u8]) -> Option<()> {
